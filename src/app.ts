@@ -3,9 +3,20 @@ import swagger from "@fastify/swagger";
 import swaggerUi from "@fastify/swagger-ui";
 
 import { healthRoutes } from "./api/routes/health.js";
+import { paymentRoutes } from "./api/routes/payments.js";
+import { prisma } from "./config/prisma.js";
+import { PrismaPaymentRepository } from "./repositories/prisma-payment-repository.js";
+import { PaymentService } from "./services/payment-service.js";
 
-export async function buildApp() {
-  const app = Fastify({ logger: true });
+export interface BuildAppOptions {
+  logger?: boolean;
+}
+
+const paymentRepository = new PrismaPaymentRepository(prisma);
+const paymentService = new PaymentService(paymentRepository);
+
+export async function buildApp(options: BuildAppOptions = {}) {
+  const app = Fastify({ logger: options.logger ?? true });
 
   await app.register(swagger, {
     openapi: {
@@ -22,6 +33,11 @@ export async function buildApp() {
   });
 
   await app.register(healthRoutes);
+  await app.register(paymentRoutes, { paymentService });
+
+  app.addHook("onClose", async () => {
+    await prisma.$disconnect();
+  });
 
   return app;
 }
