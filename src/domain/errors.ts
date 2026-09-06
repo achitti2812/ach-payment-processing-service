@@ -25,3 +25,10 @@ export class PaymentNotFoundError extends Error {
     this.name = "PaymentNotFoundError";
   }
 }
+
+export class InvalidPaymentStateTransitionError extends Error {
+  constructor(from: string, to: string) {
+    super(`Invalid payment state transition: ${from} -> ${to}`);
+    this.name = "InvalidPaymentStateTransitionError";
+  }
+}

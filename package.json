@@ -9,6 +9,8 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
+    "worker:payment": "tsx src/workers/payment-worker.ts",
+    "worker:outbox": "tsx src/workers/outbox-dispatcher.ts",
     "test": "vitest run",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev"
