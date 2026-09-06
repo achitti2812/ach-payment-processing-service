@@ -79,6 +79,7 @@ describe("webhook subscription API", () => {
     "not-a-url",
     "http://example.com/webhooks",
     "ftp://example.com/webhooks",
+    "https://user:password@example.com/webhooks",
   ])("rejects invalid or insecure URL %s", async (url) => {
     const response = await app.inject({
       method: "POST",
@@ -128,18 +129,80 @@ describe("webhook subscription API", () => {
       "https://example.com/webhook-two",
     );
     expect(listed.body).not.toContain(signingSecret);
+
+    const enabled = await app.inject({
+      method: "PATCH",
+      url: `/v1/webhooks/subscriptions/${first.json().id}`,
+      payload: { enabled: true },
+    });
+    expect(enabled.statusCode).toBe(200);
+    expect(enabled.json()).toMatchObject({ enabled: true });
+    expect(enabled.json()).not.toHaveProperty("signingSecret");
+  });
+
+  it("returns an empty active list for a customer without subscriptions", async () => {
+    const response = await app.inject({
+      method: "GET",
+      url: `/v1/webhooks/subscriptions/${TEST_CUSTOMER_PREFIX}NONE`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ subscriptions: [] });
+  });
+
+  it("returns 404 for an unknown valid subscription ID", async () => {
+    const response = await app.inject({
+      method: "PATCH",
+      url: `/v1/webhooks/subscriptions/${randomUUID()}`,
+      payload: { enabled: false },
+    });
+
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toEqual({
+      statusCode: 404,
+      error: "Not Found",
+      message: "Webhook subscription not found",
+    });
+  });
+
+  it("returns 400 for a malformed subscription ID", async () => {
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/v1/webhooks/subscriptions/not-a-uuid",
+      payload: { enabled: false },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({
+      statusCode: 400,
+      error: "Bad Request",
+    });
   });
 
   it("documents subscription APIs and the outgoing payload", () => {
     const document = app.swagger();
+    const createOperation = document.paths?.["/v1/webhooks/subscriptions"]?.post;
+    const listOperation =
+      document.paths?.["/v1/webhooks/subscriptions/{customerId}"]?.get;
+    const updateOperation =
+      document.paths?.["/v1/webhooks/subscriptions/{subscriptionId}"]?.patch;
 
-    expect(document.paths?.["/v1/webhooks/subscriptions"]?.post).toBeDefined();
-    expect(
-      document.paths?.["/v1/webhooks/subscriptions/{customerId}"]?.get,
-    ).toBeDefined();
-    expect(
-      document.paths?.["/v1/webhooks/subscriptions/{subscriptionId}"]?.patch,
-    ).toBeDefined();
+    expect(createOperation).toBeDefined();
+    expect(listOperation).toBeDefined();
+    expect(updateOperation).toBeDefined();
+    expect(Object.keys(createOperation?.responses ?? {}).sort()).toEqual([
+      "201",
+      "400",
+    ]);
+    expect(Object.keys(listOperation?.responses ?? {}).sort()).toEqual(["200", "400"]);
+    expect(Object.keys(updateOperation?.responses ?? {}).sort()).toEqual([
+      "200",
+      "400",
+      "404",
+    ]);
+    expect(JSON.stringify(createOperation?.responses?.["201"])).not.toContain(
+      "signingSecret",
+    );
     expect(document.components?.schemas?.PaymentStatusChangedWebhook).toBeDefined();
   });
 });

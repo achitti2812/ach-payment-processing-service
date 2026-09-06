@@ -11,6 +11,20 @@ export interface DispatchSummary {
   failed: number;
 }
 
+export type PaymentOutboxMode = "INITIAL" | "RETRY";
+
+function defaultMode(eventType: string): PaymentOutboxMode {
+  if (eventType === PAYMENT_PROCESS_REQUESTED) {
+    return "INITIAL";
+  }
+
+  if (eventType === PAYMENT_RETRY_REQUESTED) {
+    return "RETRY";
+  }
+
+  throw new Error(`Unsupported payment outbox event type: ${eventType}`);
+}
+
 function errorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : "Unknown publication error";
   return message.slice(0, 2000);
@@ -45,6 +59,7 @@ export class OutboxDispatcher {
     private readonly repository: OutboxRepository,
     private readonly publisher: PaymentJobPublisher,
     private readonly eventType = PAYMENT_PROCESS_REQUESTED,
+    private readonly mode = defaultMode(eventType),
   ) {}
 
   async dispatchBatch(limit: number): Promise<DispatchSummary> {
@@ -57,7 +72,7 @@ export class OutboxDispatcher {
 
     for (const event of events) {
       try {
-        if (this.eventType === PAYMENT_RETRY_REQUESTED) {
+        if (this.mode === "RETRY") {
           if (!this.publisher.publishRetry) {
             throw new Error("The payment job publisher does not support retries");
           }

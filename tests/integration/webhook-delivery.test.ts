@@ -14,6 +14,7 @@ import {
   WEBHOOK_DELIVERIES_REQUESTED,
   WEBHOOK_DELIVERY_REQUESTED,
 } from "../../src/domain/outbox-event-types.js";
+import { signWebhookBody } from "../../src/domain/webhook.js";
 import {
   PaymentStatus,
   WebhookDeliveryStatus,
@@ -283,7 +284,14 @@ describe("webhook delivery processing", () => {
     expect(httpClient.requests[0]?.headers["X-Webhook-Signature"]).toMatch(
       /^[a-f0-9]{64}$/,
     );
-    expect(JSON.parse(httpClient.requests[0]?.body ?? "{}")).toEqual({
+    expect(httpClient.requests[0]?.headers["X-Webhook-Signature"]).toBe(
+      signWebhookBody(signingSecret, httpClient.requests[0]?.body ?? ""),
+    );
+    expect(httpClient.requests[0]?.headers["X-Webhook-Timestamp"]).toEqual(
+      expect.any(String),
+    );
+    const payload = JSON.parse(httpClient.requests[0]?.body ?? "{}");
+    expect(payload).toEqual({
       eventId: fixture.paymentEvent.id,
       eventType: "payment.status_changed",
       paymentId: fixture.payment.id,
@@ -292,6 +300,68 @@ describe("webhook delivery processing", () => {
       toStatus: "PROCESSING",
       reason: "Payment processing started",
       occurredAt: fixture.paymentEvent.createdAt.toISOString(),
+    });
+    expect(payload).not.toHaveProperty("sourceAccount");
+    expect(payload).not.toHaveProperty("destinationAccount");
+    expect(payload).not.toHaveProperty("signingSecret");
+  });
+
+  it.each([200, 201, 204, 299])(
+    "treats HTTP %i as successful delivery",
+    async (status) => {
+      const fixture = await createFixture();
+      await materialize();
+      const delivery = await deliveryFor(fixture.paymentEvent.id);
+      const httpClient = new SequenceHttpClient([status]);
+
+      expect(await processor(httpClient).process(delivery.id, 1)).toBe("DELIVERED");
+      expect(
+        await prisma.webhookDelivery.findUniqueOrThrow({ where: { id: delivery.id } }),
+      ).toMatchObject({
+        status: WebhookDeliveryStatus.DELIVERED,
+        attemptCount: 1,
+        lastHttpStatus: status,
+      });
+    },
+  );
+
+  it.each([302, 400, 500])(
+    "treats HTTP %i as a retryable failure",
+    async (status) => {
+      const fixture = await createFixture();
+      await materialize();
+      const delivery = await deliveryFor(fixture.paymentEvent.id);
+      const httpClient = new SequenceHttpClient([status]);
+
+      expect(await processor(httpClient).process(delivery.id, 1)).toBe("RETRYING");
+      expect(
+        await prisma.webhookDelivery.findUniqueOrThrow({ where: { id: delivery.id } }),
+      ).toMatchObject({
+        status: WebhookDeliveryStatus.RETRYING,
+        attemptCount: 1,
+        lastHttpStatus: status,
+        deliveredAt: null,
+      });
+    },
+  );
+
+  it("records a timeout as a retryable failure", async () => {
+    const fixture = await createFixture();
+    await materialize();
+    const delivery = await deliveryFor(fixture.paymentEvent.id);
+    const timeout = new Error("operation aborted");
+    timeout.name = "TimeoutError";
+    const httpClient = new SequenceHttpClient([timeout]);
+
+    expect(await processor(httpClient).process(delivery.id, 1)).toBe("RETRYING");
+    expect(
+      await prisma.webhookDelivery.findUniqueOrThrow({ where: { id: delivery.id } }),
+    ).toMatchObject({
+      status: WebhookDeliveryStatus.RETRYING,
+      attemptCount: 1,
+      lastHttpStatus: null,
+      lastError: "Webhook request timed out",
+      deliveredAt: null,
     });
   });
 
@@ -318,6 +388,7 @@ describe("webhook delivery processing", () => {
     });
     expect(retrying.nextAttemptAt).not.toBeNull();
     expect(retrying.lastError).toContain("HTTP 500");
+    expect(retrying.deliveredAt).toBeNull();
 
     await makeAttemptDue(delivery.id);
     expect(await deliveryProcessor.process(delivery.id, 2)).toBe("DELIVERED");
@@ -364,6 +435,28 @@ describe("webhook delivery processing", () => {
       (await prisma.payment.findUniqueOrThrow({ where: { id: fixture.payment.id } }))
         .status,
     ).toBe(PaymentStatus.PROCESSING);
+  });
+
+  it("allows only one concurrent claim of the first delivery attempt", async () => {
+    const fixture = await createFixture();
+    await materialize();
+    const delivery = await deliveryFor(fixture.paymentEvent.id);
+    const httpClient = new SequenceHttpClient([200]);
+    const deliveryProcessor = processor(httpClient);
+
+    const outcomes = await Promise.all([
+      deliveryProcessor.process(delivery.id, 1),
+      deliveryProcessor.process(delivery.id, 1),
+    ]);
+
+    expect(outcomes.sort()).toEqual(["DELIVERED", "SKIPPED"]);
+    expect(httpClient.requests).toHaveLength(1);
+    expect(
+      await prisma.webhookDelivery.findUniqueOrThrow({ where: { id: delivery.id } }),
+    ).toMatchObject({
+      status: WebhookDeliveryStatus.DELIVERED,
+      attemptCount: 1,
+    });
   });
 
   it("claims a duplicate attempt once and ignores its stale replay", async () => {

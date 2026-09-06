@@ -50,6 +50,19 @@ export class PrismaPaymentProcessingRepository implements PaymentProcessingRepos
         payment.nextRetryAt !== null &&
         payment.nextRetryAt <= claimedAt;
 
+      if (
+        payment.status === PaymentStatus.RETRYING &&
+        expectedAttemptNumber === payment.attemptCount + 1 &&
+        payment.attemptCount < payment.maxAttempts &&
+        payment.nextRetryAt !== null &&
+        payment.nextRetryAt > claimedAt
+      ) {
+        return {
+          outcome: "NOT_DUE",
+          nextRetryAt: payment.nextRetryAt,
+        };
+      }
+
       if (!isInitialAttempt && !isDueRetry) {
         return { outcome: "SKIPPED", status: payment.status };
       }

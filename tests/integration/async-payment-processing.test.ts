@@ -162,6 +162,7 @@ async function processQueuedPaymentUntilTerminal(
     outboxRepository,
     publisher,
     TEST_OUTBOX_TYPE,
+    "INITIAL",
   );
   const retryDispatcher = new OutboxDispatcher(
     outboxRepository,
@@ -223,6 +224,7 @@ describe("outbox dispatcher", () => {
       outboxRepository,
       new BullMqPaymentJobPublisher(queue),
       TEST_OUTBOX_TYPE,
+      "INITIAL",
     );
 
     const summary = await dispatcher.dispatchBatch(10);
@@ -251,6 +253,7 @@ describe("outbox dispatcher", () => {
         },
       },
       TEST_OUTBOX_TYPE,
+      "INITIAL",
     );
 
     const summary = await dispatcher.dispatchBatch(10);
@@ -263,6 +266,24 @@ describe("outbox dispatcher", () => {
     expect(outbox.publishAttempts).toBe(1);
     expect(outbox.lastError).toBe("Redis unavailable");
     expect(await queue.getJob(payment.id)).toBeUndefined();
+
+    const recoveryDispatcher = new OutboxDispatcher(
+      outboxRepository,
+      new BullMqPaymentJobPublisher(queue),
+      TEST_OUTBOX_TYPE,
+      "INITIAL",
+    );
+    expect(await recoveryDispatcher.dispatchBatch(10)).toMatchObject({
+      published: 1,
+      failed: 0,
+    });
+    expect(await queue.getJob(payment.id)).not.toBeNull();
+    expect(
+      await prisma.outboxEvent.findUniqueOrThrow({ where: { id: outbox.id } }),
+    ).toMatchObject({
+      publishAttempts: 2,
+      lastError: null,
+    });
   });
 
   it("deduplicates duplicate outbox publication by payment job ID", async () => {
@@ -278,6 +299,7 @@ describe("outbox dispatcher", () => {
       outboxRepository,
       new BullMqPaymentJobPublisher(queue),
       TEST_OUTBOX_TYPE,
+      "INITIAL",
     );
 
     const summary = await dispatcher.dispatchBatch(10);
@@ -291,6 +313,83 @@ describe("outbox dispatcher", () => {
         where: { aggregateId: payment.id, publishedAt: { not: null } },
       }),
     ).toBe(2);
+  });
+
+  it("does not republish an already published outbox row", async () => {
+    const payment = await createPendingPayment("SUCCESS-ALREADY-PUBLISHED", true);
+    const dispatcher = new OutboxDispatcher(
+      outboxRepository,
+      new BullMqPaymentJobPublisher(queue),
+      TEST_OUTBOX_TYPE,
+      "INITIAL",
+    );
+
+    expect(await dispatcher.dispatchBatch(10)).toMatchObject({ published: 1 });
+    expect(await dispatcher.dispatchBatch(10)).toEqual({
+      found: 0,
+      published: 0,
+      failed: 0,
+    });
+    expect(await queue.getJobs(["wait", "delayed", "completed", "failed"])).toHaveLength(1);
+    expect(
+      (await prisma.outboxEvent.findFirstOrThrow({
+        where: { aggregateId: payment.id, type: TEST_OUTBOX_TYPE },
+      })).publishAttempts,
+    ).toBe(1);
+  });
+
+  it("keeps concurrent dispatcher activity logically idempotent", async () => {
+    const payment = await createPendingPayment("SUCCESS-CONCURRENT-DISPATCH", true);
+    const first = new OutboxDispatcher(
+      outboxRepository,
+      new BullMqPaymentJobPublisher(queue),
+      TEST_OUTBOX_TYPE,
+      "INITIAL",
+    );
+    const second = new OutboxDispatcher(
+      outboxRepository,
+      new BullMqPaymentJobPublisher(queue),
+      TEST_OUTBOX_TYPE,
+      "INITIAL",
+    );
+
+    await Promise.all([first.dispatchBatch(10), second.dispatchBatch(10)]);
+
+    expect(await queue.getJobs(["wait", "delayed", "completed", "failed"])).toHaveLength(1);
+    expect(
+      await prisma.outboxEvent.count({
+        where: {
+          aggregateId: payment.id,
+          type: TEST_OUTBOX_TYPE,
+          publishedAt: { not: null },
+        },
+      }),
+    ).toBe(1);
+  });
+
+  it("rejects unsupported event types without publishing or deleting them", async () => {
+    const payment = await createPendingPayment("UNKNOWN-OUTBOX");
+    const unknownType = `UNKNOWN_${randomUUID()}`;
+    const event = await prisma.outboxEvent.create({
+      data: {
+        type: unknownType,
+        aggregateId: payment.id,
+        payload: { paymentId: payment.id },
+      },
+    });
+
+    expect(
+      () =>
+        new OutboxDispatcher(
+          outboxRepository,
+          new BullMqPaymentJobPublisher(queue),
+          unknownType,
+        ),
+    ).toThrow(`Unsupported payment outbox event type: ${unknownType}`);
+    expect(
+      await prisma.outboxEvent.findUniqueOrThrow({ where: { id: event.id } }),
+    ).toMatchObject({ publishedAt: null, publishAttempts: 0, lastError: null });
+    expect(await queue.getJobs(["wait", "delayed", "completed", "failed"])).toHaveLength(0);
   });
 });
 
@@ -398,6 +497,56 @@ describe("payment processor", () => {
     expect(await processor.processPayment(payment.id, 2)).toBe("SKIPPED");
     expect(bank.requests).toHaveLength(1);
   });
+
+  it("allows only one concurrent claim of the original payment job", async () => {
+    const payment = await createPendingPayment("PAYMENT-CONCURRENT-ORIGINAL");
+    const bank = new RecordingBankClient({
+      outcome: "SUCCESS",
+      bankExecutionId: "BANK-CONCURRENT-ORIGINAL",
+    });
+    const processor = new PaymentProcessor(paymentRepository, bank);
+
+    const outcomes = await Promise.all([
+      processor.processPayment(payment.id),
+      processor.processPayment(payment.id),
+    ]);
+
+    expect(outcomes.sort()).toEqual(["COMPLETED", "SKIPPED"]);
+    expect(bank.requests).toHaveLength(1);
+    const processed = await paymentWithEvents(payment.id);
+    expect(processed.attemptCount).toBe(1);
+    expect(processed.events.map(({ sequenceNumber }) => sequenceNumber)).toEqual([1, 2, 3]);
+  });
+
+  it("records a thrown bank adapter error as a temporary failure", async () => {
+    const payment = await createPendingPayment("PAYMENT-BANK-THROWS");
+    const bank: BankClient = {
+      executePayment: async () => {
+        throw new Error("bank connection reset");
+      },
+    };
+    const processor = new PaymentProcessor(paymentRepository, bank);
+
+    expect(await processor.processPayment(payment.id)).toBe("RETRYING");
+    expect(await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } })).toMatchObject({
+      status: PaymentStatus.RETRYING,
+      attemptCount: 1,
+      failureCode: "BANK_UNAVAILABLE",
+      failureMessage: "The bank request failed temporarily",
+    });
+  });
+
+  it("does not create a payment retry for permanent failure", async () => {
+    const payment = await createPendingPayment("PAYMENT-PERM_FAIL-NO-RETRY");
+    const processor = new PaymentProcessor(paymentRepository, new SimulatedBankClient());
+
+    expect(await processor.processPayment(payment.id)).toBe("FAILED");
+    expect(
+      await prisma.outboxEvent.count({
+        where: { aggregateId: payment.id, type: PAYMENT_RETRY_REQUESTED },
+      }),
+    ).toBe(0);
+  });
 });
 
 describe("payment retries", () => {
@@ -465,7 +614,9 @@ describe("payment retries", () => {
     });
 
     expect(await processor.processPayment(payment.id)).toBe("RETRYING");
-    expect(await processor.processPayment(payment.id, 2)).toBe("SKIPPED");
+    expect(await processor.processPayment(payment.id, 2)).toMatchObject({
+      outcome: "NOT_DUE",
+    });
     expect(bank.requests).toHaveLength(1);
 
     await makeRetryDue(payment.id);
@@ -475,6 +626,8 @@ describe("payment retries", () => {
     const processed = await paymentWithEvents(payment.id);
     expect(processed.attemptCount).toBe(2);
     expect(processed.nextRetryAt).toBeNull();
+    expect(processed.failureCode).toBeNull();
+    expect(processed.failureMessage).toBeNull();
     expect(bank.requests.map(({ attemptNumber }) => attemptNumber)).toEqual([1, 2]);
     expect(processed.events.map(({ toStatus }) => toStatus)).toEqual([
       PaymentStatus.PENDING,
@@ -490,6 +643,49 @@ describe("payment retries", () => {
       "Payment retry started",
       "Payment completed",
     ]);
+  });
+
+  it("moves an early BullMQ retry job back to the database retry time", async () => {
+    const payment = await createPendingPayment("PAYMENT-TEMP_FAIL-EARLY-JOB");
+    const bank = new RecordingBankClient({
+      outcome: "TEMPORARY_FAILURE",
+      code: "BANK_BUSY",
+      message: "Bank is busy",
+    });
+    const processor = new PaymentProcessor(paymentRepository, bank, {
+      retryBaseDelayMs: 60_000,
+    });
+    expect(await processor.processPayment(payment.id)).toBe("RETRYING");
+    const retrying = await prisma.payment.findUniqueOrThrow({
+      where: { id: payment.id },
+    });
+    const publisher = new BullMqPaymentJobPublisher(queue);
+    await publisher.publishRetry(payment.id, 2, 0);
+    const workerRedis = createRedisConnection("worker");
+    const worker = createPaymentWorker(workerRedis, processor, 1, queueName);
+    const job = await queue.getJob(paymentRetryJobId(payment.id, 2));
+    const deadline = Date.now() + 3000;
+
+    try {
+      await worker.waitUntilReady();
+
+      while (Date.now() < deadline && (await job?.getState()) !== "delayed") {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      expect(await job?.getState()).toBe("delayed");
+      expect(bank.requests).toHaveLength(1);
+      expect(
+        await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } }),
+      ).toMatchObject({
+        status: PaymentStatus.RETRYING,
+        attemptCount: 1,
+        nextRetryAt: retrying.nextRetryAt,
+      });
+    } finally {
+      await worker.close();
+      await workerRedis.quit();
+    }
   });
 
   it("claims duplicate retry jobs only once and ignores stale attempts", async () => {
@@ -611,6 +807,7 @@ describe("BullMQ payment worker", () => {
       outboxRepository,
       new BullMqPaymentJobPublisher(queue),
       TEST_OUTBOX_TYPE,
+      "INITIAL",
     );
 
     try {

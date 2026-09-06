@@ -30,7 +30,7 @@ export interface WebhookDeliveryProcessorOptions {
 
 function errorMessage(error: unknown): string {
   if (error instanceof Error) {
-    return error.name === "TimeoutError"
+    return error.name === "TimeoutError" || error.name === "AbortError"
       ? "Webhook request timed out"
       : error.message;
   }

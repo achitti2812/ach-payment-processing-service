@@ -20,6 +20,10 @@ export type PaymentClaimResult =
       status: PaymentStatus;
     }
   | {
+      outcome: "NOT_DUE";
+      nextRetryAt: Date;
+    }
+  | {
       outcome: "NOT_FOUND";
     };
 

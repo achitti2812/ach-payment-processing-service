@@ -9,6 +9,10 @@ export type PaymentProcessingOutcome =
   | "SKIPPED"
   | "NOT_FOUND";
 
+export type PaymentProcessingResult =
+  | PaymentProcessingOutcome
+  | { outcome: "NOT_DUE"; nextRetryAt: Date };
+
 export function paymentExecutionKey(paymentId: string): string {
   return `payment-${paymentId}`;
 }
@@ -57,7 +61,7 @@ export class PaymentProcessor {
   async processPayment(
     paymentId: string,
     expectedAttemptNumber?: number,
-  ): Promise<PaymentProcessingOutcome> {
+  ): Promise<PaymentProcessingResult> {
     const correlationId = paymentExecutionKey(paymentId);
     const claim = await this.repository.claimPaymentAttempt(
       paymentId,
@@ -68,6 +72,10 @@ export class PaymentProcessor {
 
     if (claim.outcome === "NOT_FOUND") {
       return "NOT_FOUND";
+    }
+
+    if (claim.outcome === "NOT_DUE") {
+      return claim;
     }
 
     if (claim.outcome === "SKIPPED") {

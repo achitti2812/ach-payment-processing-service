@@ -1,4 +1,4 @@
-import { Worker } from "bullmq";
+import { DelayedError, Worker } from "bullmq";
 import type Redis from "ioredis";
 
 import {
@@ -25,8 +25,19 @@ export function createPaymentWorker(
 ): PaymentWorker {
   return new Worker<PaymentJobData, PaymentProcessingOutcome, typeof PAYMENT_JOB_NAME>(
     queueName,
-    async (job) =>
-      processor.processPayment(job.data.paymentId, job.data.attemptNumber),
+    async (job, token) => {
+      const result = await processor.processPayment(
+        job.data.paymentId,
+        job.data.attemptNumber,
+      );
+
+      if (typeof result !== "string") {
+        await job.moveToDelayed(result.nextRetryAt.getTime(), token);
+        throw new DelayedError();
+      }
+
+      return result;
+    },
     {
       connection,
       concurrency,

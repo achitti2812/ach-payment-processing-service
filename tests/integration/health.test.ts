@@ -18,4 +18,11 @@ describe("GET /health/live", () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ status: "ok" });
   });
+
+  it("appears in OpenAPI with its actual response code", () => {
+    const operation = app.swagger().paths?.["/health/live"]?.get;
+
+    expect(operation).toBeDefined();
+    expect(Object.keys(operation?.responses ?? {})).toEqual(["200"]);
+  });
 });

@@ -115,7 +115,15 @@ describe("POST /v1/payments", () => {
   });
 
   it("documents the payment submission endpoint in OpenAPI", () => {
-    expect(app.swagger().paths?.["/v1/payments"]?.post).toBeDefined();
+    const operation = app.swagger().paths?.["/v1/payments"]?.post;
+
+    expect(operation).toBeDefined();
+    expect(Object.keys(operation?.responses ?? {}).sort()).toEqual([
+      "200",
+      "202",
+      "400",
+      "409",
+    ]);
   });
 
   it("rejects a request without an Idempotency-Key", async () => {
@@ -129,7 +137,52 @@ describe("POST /v1/payments", () => {
     expect(await prisma.payment.count({ where: { customerId: CUSTOMER_ID } })).toBe(0);
   });
 
-  it.each(["0", "-1.00", "12.345"])("rejects invalid amount %s", async (amount) => {
+  it.each([
+    "customerId",
+    "sourceAccount",
+    "destinationAccount",
+    "amount",
+    "reference",
+  ] as const)("rejects a request missing %s", async (field) => {
+    const payload: Record<string, string> = { ...validPayment };
+    delete payload[field];
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/payments",
+      headers: { "idempotency-key": `missing-${field}` },
+      payload,
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(await prisma.payment.count({ where: { customerId: CUSTOMER_ID } })).toBe(0);
+  });
+
+  it.each([
+    "customerId",
+    "sourceAccount",
+    "destinationAccount",
+    "reference",
+  ] as const)("rejects whitespace-only %s", async (field) => {
+    const response = await submitPayment(`whitespace-${field}`, {
+      ...validPayment,
+      [field]: "   ",
+    });
+
+    expect(response.statusCode).toBe(400);
+  });
+
+  it.each([
+    "0",
+    "0.00",
+    "-1.00",
+    "12.345",
+    "1.",
+    ".50",
+    "+1.00",
+    "1e2",
+    "NaN",
+  ])("rejects invalid amount %s", async (amount) => {
     const response = await submitPayment("invalid-amount", {
       ...validPayment,
       amount,
@@ -139,11 +192,68 @@ describe("POST /v1/payments", () => {
     expect(await prisma.payment.count({ where: { customerId: CUSTOMER_ID } })).toBe(0);
   });
 
+  it("accepts the DECIMAL(18,2) maximum and rejects overflow", async () => {
+    const maximum = await submitPayment("maximum-amount", {
+      ...validPayment,
+      amount: "9999999999999999.99",
+    });
+    const overflow = await submitPayment("overflow-amount", {
+      ...validPayment,
+      amount: "10000000000000000.00",
+    });
+
+    expect(maximum.statusCode).toBe(202);
+    expect(maximum.json().amount).toBe("9999999999999999.99");
+    expect(overflow.statusCode).toBe(400);
+  });
+
+  it.each([
+    "customerId",
+    "sourceAccount",
+    "destinationAccount",
+    "reference",
+  ] as const)("rejects %s longer than 255 characters", async (field) => {
+    const response = await submitPayment(`long-${field}`, {
+      ...validPayment,
+      [field]: "x".repeat(256),
+    });
+
+    expect(response.statusCode).toBe(400);
+  });
+
+  it.each(["", "   ", "x".repeat(256)])(
+    "rejects invalid Idempotency-Key %j",
+    async (idempotencyKey) => {
+      const response = await submitPayment(idempotencyKey);
+
+      expect(response.statusCode).toBe(400);
+      expect(
+        await prisma.payment.count({ where: { customerId: CUSTOMER_ID } }),
+      ).toBe(0);
+    },
+  );
+
   it("returns the original payment for the same key and normalized payload", async () => {
     const firstResponse = await submitPayment("same-request");
     const replayResponse = await submitPayment("same-request", {
       ...validPayment,
       amount: "250",
+    });
+
+    expect(firstResponse.statusCode).toBe(202);
+    expect(replayResponse.statusCode).toBe(200);
+    expect(replayResponse.json()).toEqual(firstResponse.json());
+    expect(await prisma.payment.count({ where: { customerId: CUSTOMER_ID } })).toBe(1);
+  });
+
+  it("treats trimmed strings and normalized amount as the same idempotent request", async () => {
+    const firstResponse = await submitPayment("normalized-request");
+    const replayResponse = await submitPayment("  normalized-request  ", {
+      customerId: `  ${CUSTOMER_ID}  `,
+      sourceAccount: "  VA10001  ",
+      destinationAccount: "  EXT98765  ",
+      amount: "250.0",
+      reference: "  PMT-1001  ",
     });
 
     expect(firstResponse.statusCode).toBe(202);

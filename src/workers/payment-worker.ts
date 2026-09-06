@@ -45,11 +45,18 @@ async function shutdown(): Promise<void> {
   await prisma.$disconnect();
 }
 
+function requestShutdown(): void {
+  void shutdown().catch((error: unknown) => {
+    console.error("Payment worker shutdown failed", error);
+    process.exitCode = 1;
+  });
+}
+
 process.once("SIGINT", () => {
-  void shutdown();
+  requestShutdown();
 });
 process.once("SIGTERM", () => {
-  void shutdown();
+  requestShutdown();
 });
 
 await worker.waitUntilReady();

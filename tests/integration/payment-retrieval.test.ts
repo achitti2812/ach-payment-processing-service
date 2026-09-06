@@ -163,6 +163,38 @@ describe("GET /v1/payments/:paymentId", () => {
       ].sort(),
     );
   });
+
+  it("returns stable terminal payment details", async () => {
+    const created = await createPayment();
+    const completedAt = new Date("2026-09-06T12:00:00.000Z");
+    await prisma.payment.update({
+      where: { id: created.id },
+      data: {
+        status: PaymentStatus.COMPLETED,
+        attemptCount: 1,
+        bankExecutionId: `BANK-${created.id}`,
+        completedAt,
+      },
+    });
+
+    const first = await app.inject({
+      method: "GET",
+      url: `/v1/payments/${created.id}`,
+    });
+    const second = await app.inject({
+      method: "GET",
+      url: `/v1/payments/${created.id}`,
+    });
+
+    expect(first.statusCode).toBe(200);
+    expect(second.json()).toEqual(first.json());
+    expect(first.json()).toMatchObject({
+      status: "COMPLETED",
+      attemptCount: 1,
+      completedAt: completedAt.toISOString(),
+    });
+    expect(first.json()).not.toHaveProperty("bankExecutionId");
+  });
 });
 
 describe("GET /v1/payments/:paymentId/events", () => {
@@ -226,6 +258,25 @@ describe("GET /v1/payments/:paymentId/events", () => {
     ]);
   });
 
+  it("enforces unique sequence numbers per payment", async () => {
+    const created = await createPayment();
+
+    await expect(
+      prisma.paymentEvent.create({
+        data: {
+          paymentId: created.id,
+          sequenceNumber: 1,
+          fromStatus: null,
+          toStatus: PaymentStatus.PENDING,
+          reason: "Duplicate sequence",
+          actor: "test",
+          correlationId: "duplicate-sequence",
+        },
+      }),
+    ).rejects.toMatchObject({ code: "P2002" });
+    expect(await prisma.paymentEvent.count({ where: { paymentId: created.id } })).toBe(1);
+  });
+
   it("returns 404 for an unknown payment", async () => {
     const response = await app.inject({
       method: "GET",
@@ -261,6 +312,9 @@ describe("GET /v1/payments/:paymentId/events", () => {
         "toStatus",
       ].sort(),
     );
+    expect(response.body).not.toContain("sourceAccount");
+    expect(response.body).not.toContain("destinationAccount");
+    expect(response.body).not.toContain("amount");
   });
 });
 
@@ -270,6 +324,10 @@ describe("payment read API validation and documentation", () => {
     async (url) => {
       const response = await app.inject({ method: "GET", url });
       expect(response.statusCode).toBe(400);
+      expect(response.json()).toMatchObject({
+        statusCode: 400,
+        error: "Bad Request",
+      });
     },
   );
 
@@ -278,5 +336,13 @@ describe("payment read API validation and documentation", () => {
 
     expect(paths?.["/v1/payments/{paymentId}"]?.get).toBeDefined();
     expect(paths?.["/v1/payments/{paymentId}/events"]?.get).toBeDefined();
+    expect(
+      Object.keys(paths?.["/v1/payments/{paymentId}"]?.get?.responses ?? {}).sort(),
+    ).toEqual(["200", "400", "404"]);
+    expect(
+      Object.keys(
+        paths?.["/v1/payments/{paymentId}/events"]?.get?.responses ?? {},
+      ).sort(),
+    ).toEqual(["200", "400", "404"]);
   });
 });

@@ -8,6 +8,9 @@ import {
   type PaymentStatusChangedWebhookPayload,
 } from "../../src/domain/webhook.js";
 import { PaymentStatus } from "../../src/generated/prisma/enums.js";
+import { InvalidWebhookSubscriptionError } from "../../src/domain/errors.js";
+import type { WebhookSubscriptionRepository } from "../../src/repositories/webhook-subscription-repository.js";
+import { WebhookSubscriptionService } from "../../src/services/webhook-subscription-service.js";
 
 const payload: PaymentStatusChangedWebhookPayload = {
   eventId: "18ca0b18-f236-4ae8-a233-d676dcfc45b7",
@@ -60,5 +63,26 @@ describe("webhook retry backoff", () => {
     [4, 8000],
   ])("calculates failed attempt %i as %i ms", (attempt, expected) => {
     expect(calculateWebhookRetryDelay(1000, attempt)).toBe(expected);
+  });
+});
+
+describe("production webhook URL validation", () => {
+  const repository: WebhookSubscriptionRepository = {
+    create: async () => {
+      throw new Error("create should not be reached");
+    },
+    findEnabledByCustomer: async () => [],
+    setEnabled: async () => null,
+  };
+  const service = new WebhookSubscriptionService(repository, "production");
+
+  it("rejects loopback HTTP in production", async () => {
+    await expect(
+      service.create({
+        customerId: "C12345",
+        url: "http://localhost:4000/success",
+        signingSecret: "a-strong-test-secret",
+      }),
+    ).rejects.toBeInstanceOf(InvalidWebhookSubscriptionError);
   });
 });

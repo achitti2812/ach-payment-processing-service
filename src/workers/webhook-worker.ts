@@ -46,8 +46,15 @@ async function shutdown(): Promise<void> {
   await prisma.$disconnect();
 }
 
-process.once("SIGINT", () => void shutdown());
-process.once("SIGTERM", () => void shutdown());
+function requestShutdown(): void {
+  void shutdown().catch((error: unknown) => {
+    console.error("Webhook worker shutdown failed", error);
+    process.exitCode = 1;
+  });
+}
+
+process.once("SIGINT", requestShutdown);
+process.once("SIGTERM", requestShutdown);
 
 await worker.waitUntilReady();
 console.log(
