@@ -32,3 +32,17 @@ export class InvalidPaymentStateTransitionError extends Error {
     this.name = "InvalidPaymentStateTransitionError";
   }
 }
+
+export class InvalidWebhookSubscriptionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidWebhookSubscriptionError";
+  }
+}
+
+export class WebhookSubscriptionNotFoundError extends Error {
+  constructor() {
+    super("Webhook subscription not found");
+    this.name = "WebhookSubscriptionNotFoundError";
+  }
+}

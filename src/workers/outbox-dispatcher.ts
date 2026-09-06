@@ -9,11 +9,19 @@ import {
   BullMqPaymentJobPublisher,
   createPaymentQueue,
 } from "../queues/payment-queue.js";
+import {
+  BullMqWebhookJobPublisher,
+  createWebhookQueue,
+} from "../queues/webhook-queue.js";
 import { PrismaOutboxRepository } from "../repositories/prisma-outbox-repository.js";
+import { PrismaWebhookEventRepository } from "../repositories/prisma-webhook-event-repository.js";
 import { OutboxDispatcher } from "../services/outbox-dispatcher.js";
+import { WebhookEventMaterializer } from "../services/webhook-event-materializer.js";
+import { WebhookJobOutboxDispatcher } from "../services/webhook-job-outbox-dispatcher.js";
 
 const redis = createRedisConnection("producer");
 const queue = createPaymentQueue(redis);
+const webhookQueue = createWebhookQueue(redis);
 const repository = new PrismaOutboxRepository(prisma);
 const publisher = new BullMqPaymentJobPublisher(queue);
 const paymentDispatcher = new OutboxDispatcher(
@@ -25,6 +33,14 @@ const retryDispatcher = new OutboxDispatcher(
   repository,
   publisher,
   PAYMENT_RETRY_REQUESTED,
+);
+const webhookMaterializer = new WebhookEventMaterializer(
+  repository,
+  new PrismaWebhookEventRepository(prisma),
+);
+const webhookJobDispatcher = new WebhookJobOutboxDispatcher(
+  repository,
+  new BullMqWebhookJobPublisher(webhookQueue),
 );
 
 let stopping = false;
@@ -47,8 +63,22 @@ try {
     try {
       const paymentSummary = await paymentDispatcher.dispatchBatch(env.OUTBOX_BATCH_SIZE);
       const retrySummary = await retryDispatcher.dispatchBatch(env.OUTBOX_BATCH_SIZE);
-      const found = paymentSummary.found + retrySummary.found;
-      const failed = paymentSummary.failed + retrySummary.failed;
+      const webhookMaterializationSummary = await webhookMaterializer.materializeBatch(
+        env.OUTBOX_BATCH_SIZE,
+      );
+      const webhookJobSummary = await webhookJobDispatcher.dispatchBatch(
+        env.OUTBOX_BATCH_SIZE,
+      );
+      const found =
+        paymentSummary.found +
+        retrySummary.found +
+        webhookMaterializationSummary.found +
+        webhookJobSummary.found;
+      const failed =
+        paymentSummary.failed +
+        retrySummary.failed +
+        webhookMaterializationSummary.failed +
+        webhookJobSummary.failed;
 
       if (found === 0 || failed > 0) {
         await wait(env.OUTBOX_POLL_INTERVAL_MS);
@@ -60,6 +90,7 @@ try {
   }
 } finally {
   await queue.close();
+  await webhookQueue.close();
   await redis.quit();
   await prisma.$disconnect();
 }

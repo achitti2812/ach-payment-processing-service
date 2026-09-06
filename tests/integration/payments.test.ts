@@ -182,7 +182,10 @@ describe("POST /v1/payments", () => {
       },
     });
     const outboxEvent = await prisma.outboxEvent.findFirst({
-      where: { aggregateId: paymentId },
+      where: {
+        aggregateId: paymentId,
+        type: "PAYMENT_PROCESS_REQUESTED",
+      },
     });
 
     expect(paymentEvent).toMatchObject({
@@ -263,6 +266,6 @@ describe("POST /v1/payments", () => {
       }),
     ).toBe(1);
     expect(await prisma.paymentEvent.count({ where: { paymentId } })).toBe(1);
-    expect(await prisma.outboxEvent.count({ where: { aggregateId: paymentId } })).toBe(1);
+    expect(await prisma.outboxEvent.count({ where: { aggregateId: paymentId } })).toBe(2);
   });
 });

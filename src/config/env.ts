@@ -42,4 +42,24 @@ export const env = Object.freeze({
     1000,
     "PAYMENT_RETRY_BASE_DELAY_MS",
   ),
+  WEBHOOK_RETRY_BASE_DELAY_MS: positiveInteger(
+    process.env.WEBHOOK_RETRY_BASE_DELAY_MS,
+    1000,
+    "WEBHOOK_RETRY_BASE_DELAY_MS",
+  ),
+  WEBHOOK_MAX_ATTEMPTS: positiveInteger(
+    process.env.WEBHOOK_MAX_ATTEMPTS,
+    5,
+    "WEBHOOK_MAX_ATTEMPTS",
+  ),
+  WEBHOOK_REQUEST_TIMEOUT_MS: positiveInteger(
+    process.env.WEBHOOK_REQUEST_TIMEOUT_MS,
+    5000,
+    "WEBHOOK_REQUEST_TIMEOUT_MS",
+  ),
+  WEBHOOK_WORKER_CONCURRENCY: positiveInteger(
+    process.env.WEBHOOK_WORKER_CONCURRENCY,
+    5,
+    "WEBHOOK_WORKER_CONCURRENCY",
+  ),
 });

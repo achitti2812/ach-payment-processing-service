@@ -13,6 +13,7 @@ import type {
   PaymentRecord,
   PaymentRepository,
 } from "./payment-repository.js";
+import { createWebhookDeliveriesOutboxEvent } from "./webhook-event-outbox.js";
 
 const paymentSelect = {
   id: true,
@@ -109,7 +110,7 @@ export class PrismaPaymentRepository implements PaymentRepository {
           },
         });
 
-        await transaction.paymentEvent.create({
+        const paymentEvent = await transaction.paymentEvent.create({
           data: {
             paymentId: payment.id,
             sequenceNumber: 1,
@@ -120,6 +121,12 @@ export class PrismaPaymentRepository implements PaymentRepository {
             correlationId: params.correlationId,
           },
         });
+
+        await createWebhookDeliveriesOutboxEvent(
+          transaction,
+          payment.id,
+          paymentEvent.id,
+        );
 
         await transaction.outboxEvent.create({
           data: {

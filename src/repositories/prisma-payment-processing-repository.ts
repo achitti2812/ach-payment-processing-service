@@ -10,6 +10,7 @@ import type {
   PaymentProcessingRepository,
   ProcessingTransitionParams,
 } from "./payment-processing-repository.js";
+import { createWebhookDeliveriesOutboxEvent } from "./webhook-event-outbox.js";
 
 export class PrismaPaymentProcessingRepository implements PaymentProcessingRepository {
   constructor(private readonly client: PrismaClient) {}
@@ -103,7 +104,7 @@ export class PrismaPaymentProcessingRepository implements PaymentProcessingRepos
         _max: { sequenceNumber: true },
       });
 
-      await transaction.paymentEvent.create({
+      const paymentEvent = await transaction.paymentEvent.create({
         data: {
           paymentId,
           sequenceNumber: (sequence._max.sequenceNumber ?? 0) + 1,
@@ -116,6 +117,12 @@ export class PrismaPaymentProcessingRepository implements PaymentProcessingRepos
           correlationId,
         },
       });
+
+      await createWebhookDeliveriesOutboxEvent(
+        transaction,
+        paymentId,
+        paymentEvent.id,
+      );
 
       return {
         outcome: "CLAIMED",
@@ -167,7 +174,7 @@ export class PrismaPaymentProcessingRepository implements PaymentProcessingRepos
         _max: { sequenceNumber: true },
       });
 
-      await transaction.paymentEvent.create({
+      const paymentEvent = await transaction.paymentEvent.create({
         data: {
           paymentId: params.paymentId,
           sequenceNumber: (sequence._max.sequenceNumber ?? 0) + 1,
@@ -178,6 +185,12 @@ export class PrismaPaymentProcessingRepository implements PaymentProcessingRepos
           correlationId: params.correlationId,
         },
       });
+
+      await createWebhookDeliveriesOutboxEvent(
+        transaction,
+        params.paymentId,
+        paymentEvent.id,
+      );
 
       if (params.toStatus === PaymentStatus.RETRYING && params.retrySchedule) {
         await transaction.outboxEvent.create({
