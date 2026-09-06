@@ -5,10 +5,14 @@ import type { FastifyPluginAsync } from "fastify";
 import {
   IdempotencyConflictError,
   InvalidPaymentRequestError,
+  PaymentNotFoundError,
 } from "../../domain/errors.js";
 import type { PaymentService } from "../../services/payment-service.js";
 import {
+  getPaymentEventsSchema,
+  getPaymentSchema,
   submitPaymentSchema,
+  type PaymentParams,
   type SubmitPaymentBody,
   type SubmitPaymentHeaders,
 } from "../schemas/payments.js";
@@ -21,6 +25,54 @@ export const paymentRoutes: FastifyPluginAsync<PaymentRouteOptions> = async (
   app,
   options,
 ) => {
+  app.get<{ Params: PaymentParams }>(
+    "/v1/payments/:paymentId",
+    {
+      schema: getPaymentSchema,
+    },
+    async (request, reply) => {
+      try {
+        const payment = await options.paymentService.getPayment(request.params.paymentId);
+        return reply.code(200).send(payment);
+      } catch (error) {
+        if (error instanceof PaymentNotFoundError) {
+          return reply.code(404).send({
+            statusCode: 404,
+            error: "Not Found",
+            message: error.message,
+          });
+        }
+
+        throw error;
+      }
+    },
+  );
+
+  app.get<{ Params: PaymentParams }>(
+    "/v1/payments/:paymentId/events",
+    {
+      schema: getPaymentEventsSchema,
+    },
+    async (request, reply) => {
+      try {
+        const history = await options.paymentService.getPaymentAuditHistory(
+          request.params.paymentId,
+        );
+        return reply.code(200).send(history);
+      } catch (error) {
+        if (error instanceof PaymentNotFoundError) {
+          return reply.code(404).send({
+            statusCode: 404,
+            error: "Not Found",
+            message: error.message,
+          });
+        }
+
+        throw error;
+      }
+    },
+  );
+
   app.post<{
     Body: SubmitPaymentBody;
     Headers: SubmitPaymentHeaders;

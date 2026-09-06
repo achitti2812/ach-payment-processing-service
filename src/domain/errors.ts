@@ -18,3 +18,10 @@ export class IdempotencyKeyAlreadyExistsError extends Error {
     this.name = "IdempotencyKeyAlreadyExistsError";
   }
 }
+
+export class PaymentNotFoundError extends Error {
+  constructor() {
+    super("Payment not found");
+    this.name = "PaymentNotFoundError";
+  }
+}

@@ -4,6 +4,7 @@ import {
   IdempotencyConflictError,
   IdempotencyKeyAlreadyExistsError,
   InvalidPaymentRequestError,
+  PaymentNotFoundError,
 } from "../domain/errors.js";
 import {
   hashPaymentSubmission,
@@ -12,6 +13,8 @@ import {
 } from "../domain/payment.js";
 import type {
   IdempotentPaymentRecord,
+  PaymentAuditHistoryRecord,
+  PaymentDetailsRecord,
   PaymentRecord,
   PaymentRepository,
 } from "../repositories/payment-repository.js";
@@ -35,6 +38,30 @@ export interface PaymentSubmissionResult {
   replayed: boolean;
 }
 
+export interface PaymentDetailsResponse extends PaymentResponse {
+  attemptCount: number;
+  maxAttempts: number;
+  failureCode: string | null;
+  failureMessage: string | null;
+  completedAt: string | null;
+}
+
+export interface PaymentEventResponse {
+  id: string;
+  sequenceNumber: number;
+  fromStatus: PaymentStatus | null;
+  toStatus: PaymentStatus;
+  reason: string;
+  actor: string;
+  correlationId: string;
+  createdAt: string;
+}
+
+export interface PaymentAuditHistoryResponse {
+  paymentId: string;
+  events: PaymentEventResponse[];
+}
+
 function toPaymentResponse(payment: PaymentRecord): PaymentResponse {
   return {
     id: payment.id,
@@ -46,6 +73,35 @@ function toPaymentResponse(payment: PaymentRecord): PaymentResponse {
     status: payment.status,
     createdAt: payment.createdAt.toISOString(),
     updatedAt: payment.updatedAt.toISOString(),
+  };
+}
+
+function toPaymentDetailsResponse(payment: PaymentDetailsRecord): PaymentDetailsResponse {
+  return {
+    ...toPaymentResponse(payment),
+    attemptCount: payment.attemptCount,
+    maxAttempts: payment.maxAttempts,
+    failureCode: payment.failureCode,
+    failureMessage: payment.failureMessage,
+    completedAt: payment.completedAt?.toISOString() ?? null,
+  };
+}
+
+function toPaymentAuditHistoryResponse(
+  payment: PaymentAuditHistoryRecord,
+): PaymentAuditHistoryResponse {
+  return {
+    paymentId: payment.id,
+    events: payment.events.map((event) => ({
+      id: event.id,
+      sequenceNumber: event.sequenceNumber,
+      fromStatus: event.fromStatus,
+      toStatus: event.toStatus,
+      reason: event.reason,
+      actor: event.actor,
+      correlationId: event.correlationId,
+      createdAt: event.createdAt.toISOString(),
+    })),
   };
 }
 
@@ -79,6 +135,26 @@ function normalizeHeader(value: string, name: string): string {
 
 export class PaymentService {
   constructor(private readonly repository: PaymentRepository) {}
+
+  async getPayment(paymentId: string): Promise<PaymentDetailsResponse> {
+    const payment = await this.repository.findPaymentById(paymentId);
+
+    if (!payment) {
+      throw new PaymentNotFoundError();
+    }
+
+    return toPaymentDetailsResponse(payment);
+  }
+
+  async getPaymentAuditHistory(paymentId: string): Promise<PaymentAuditHistoryResponse> {
+    const payment = await this.repository.findPaymentAuditHistory(paymentId);
+
+    if (!payment) {
+      throw new PaymentNotFoundError();
+    }
+
+    return toPaymentAuditHistoryResponse(payment);
+  }
 
   async submitPayment(
     input: PaymentSubmissionInput,

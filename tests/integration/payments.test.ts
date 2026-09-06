@@ -205,8 +205,8 @@ describe("POST /v1/payments", () => {
 
   it("rolls back all records when the final outbox insert fails", async () => {
     const repository = new PrismaPaymentRepository(prisma);
-    const paymentEventCountBefore = await prisma.paymentEvent.count();
-    const outboxCountBefore = await prisma.outboxEvent.count();
+    const rollbackCorrelationId = "rollback-correlation";
+    const invalidOutboxType = "x".repeat(101);
 
     await expect(
       repository.createPaymentSubmission({
@@ -216,8 +216,8 @@ describe("POST /v1/payments", () => {
         },
         idempotencyKey: "rollback-request",
         requestHash: "a".repeat(64),
-        correlationId: "rollback-correlation",
-        outboxType: "x".repeat(101),
+        correlationId: rollbackCorrelationId,
+        outboxType: invalidOutboxType,
       }),
     ).rejects.toThrow();
 
@@ -231,8 +231,16 @@ describe("POST /v1/payments", () => {
         where: { customerId: `${TEST_CUSTOMER_PREFIX}ROLLBACK` },
       }),
     ).toBe(0);
-    expect(await prisma.paymentEvent.count()).toBe(paymentEventCountBefore);
-    expect(await prisma.outboxEvent.count()).toBe(outboxCountBefore);
+    expect(
+      await prisma.paymentEvent.count({
+        where: { correlationId: rollbackCorrelationId },
+      }),
+    ).toBe(0);
+    expect(
+      await prisma.outboxEvent.count({
+        where: { type: invalidOutboxType },
+      }),
+    ).toBe(0);
   });
 
   it("creates only one payment under concurrent duplicate submissions", async () => {

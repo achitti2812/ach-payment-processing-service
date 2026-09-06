@@ -8,6 +8,8 @@ import { IdempotencyKeyAlreadyExistsError } from "../domain/errors.js";
 import type {
   CreatePaymentSubmissionParams,
   IdempotentPaymentRecord,
+  PaymentAuditHistoryRecord,
+  PaymentDetailsRecord,
   PaymentRecord,
   PaymentRepository,
 } from "./payment-repository.js";
@@ -20,9 +22,25 @@ const paymentSelect = {
   amount: true,
   reference: true,
   status: true,
+  attemptCount: true,
+  maxAttempts: true,
+  failureCode: true,
+  failureMessage: true,
   createdAt: true,
   updatedAt: true,
+  completedAt: true,
 } satisfies Prisma.PaymentSelect;
+
+const paymentEventSelect = {
+  id: true,
+  sequenceNumber: true,
+  fromStatus: true,
+  toStatus: true,
+  reason: true,
+  actor: true,
+  correlationId: true,
+  createdAt: true,
+} satisfies Prisma.PaymentEventSelect;
 
 export class PrismaPaymentRepository implements PaymentRepository {
   constructor(private readonly client: PrismaClient) {}
@@ -42,6 +60,28 @@ export class PrismaPaymentRepository implements PaymentRepository {
         requestHash: true,
         payment: {
           select: paymentSelect,
+        },
+      },
+    });
+  }
+
+  async findPaymentById(paymentId: string): Promise<PaymentDetailsRecord | null> {
+    return this.client.payment.findUnique({
+      where: { id: paymentId },
+      select: paymentSelect,
+    });
+  }
+
+  async findPaymentAuditHistory(
+    paymentId: string,
+  ): Promise<PaymentAuditHistoryRecord | null> {
+    return this.client.payment.findUnique({
+      where: { id: paymentId },
+      select: {
+        id: true,
+        events: {
+          orderBy: { sequenceNumber: "asc" },
+          select: paymentEventSelect,
         },
       },
     });
