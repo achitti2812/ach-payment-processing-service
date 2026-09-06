@@ -6,3 +6,119 @@ generator client {
 datasource db {
   provider = "postgresql"
 }
+
+enum PaymentStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  RETRYING
+}
+
+enum WebhookDeliveryStatus {
+  PENDING
+  RETRYING
+  DELIVERED
+  FAILED
+}
+
+model Payment {
+  id                 String              @id @default(uuid()) @db.Uuid
+  customerId         String              @db.VarChar(255)
+  sourceAccount      String              @db.VarChar(255)
+  destinationAccount String              @db.VarChar(255)
+  amount             Decimal             @db.Decimal(18, 2)
+  reference          String              @db.VarChar(255)
+  status             PaymentStatus       @default(PENDING)
+  attemptCount       Int                 @default(0)
+  maxAttempts        Int                 @default(5)
+  bankExecutionId    String?             @unique @db.VarChar(255)
+  failureCode        String?             @db.VarChar(100)
+  failureMessage     String?             @db.Text
+  nextRetryAt        DateTime?           @db.Timestamptz(3)
+  createdAt          DateTime            @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime            @updatedAt @db.Timestamptz(3)
+  completedAt        DateTime?           @db.Timestamptz(3)
+  idempotencyRecords IdempotencyRecord[]
+  events             PaymentEvent[]
+
+  @@index([customerId, createdAt])
+  @@index([status, nextRetryAt])
+}
+
+model IdempotencyRecord {
+  id             String   @id @default(uuid()) @db.Uuid
+  customerId     String   @db.VarChar(255)
+  idempotencyKey String   @db.VarChar(255)
+  requestHash    String   @db.VarChar(64)
+  paymentId      String   @db.Uuid
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+  payment        Payment  @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+
+  @@unique([customerId, idempotencyKey])
+  @@index([paymentId])
+}
+
+model PaymentEvent {
+  id                String            @id @default(uuid()) @db.Uuid
+  paymentId         String            @db.Uuid
+  sequenceNumber    Int
+  fromStatus        PaymentStatus?
+  toStatus          PaymentStatus
+  reason            String            @db.Text
+  metadata          Json?
+  actor             String            @db.VarChar(100)
+  correlationId     String            @db.VarChar(255)
+  createdAt         DateTime          @default(now()) @db.Timestamptz(3)
+  payment           Payment           @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  webhookDeliveries WebhookDelivery[]
+
+  @@unique([paymentId, sequenceNumber])
+  @@index([createdAt])
+}
+
+model OutboxEvent {
+  id              String    @id @default(uuid()) @db.Uuid
+  type            String    @db.VarChar(100)
+  aggregateId     String    @db.Uuid
+  payload         Json
+  createdAt       DateTime  @default(now()) @db.Timestamptz(3)
+  publishedAt     DateTime? @db.Timestamptz(3)
+  publishAttempts Int       @default(0)
+  lastError       String?   @db.Text
+
+  @@index([publishedAt, createdAt])
+}
+
+model WebhookSubscription {
+  id            String            @id @default(uuid()) @db.Uuid
+  customerId    String            @db.VarChar(255)
+  url           String            @db.Text
+  signingSecret String            @db.Text
+  enabled       Boolean           @default(true)
+  createdAt     DateTime          @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime          @updatedAt @db.Timestamptz(3)
+  deliveries    WebhookDelivery[]
+
+  @@index([customerId, enabled])
+}
+
+model WebhookDelivery {
+  id             String                @id @default(uuid()) @db.Uuid
+  subscriptionId String                @db.Uuid
+  paymentEventId String                @db.Uuid
+  status         WebhookDeliveryStatus @default(PENDING)
+  attemptCount   Int                   @default(0)
+  nextAttemptAt  DateTime?             @db.Timestamptz(3)
+  lastHttpStatus Int?
+  lastError      String?               @db.Text
+  deliveredAt    DateTime?             @db.Timestamptz(3)
+  createdAt      DateTime              @default(now()) @db.Timestamptz(3)
+  updatedAt      DateTime              @updatedAt @db.Timestamptz(3)
+  subscription   WebhookSubscription   @relation(fields: [subscriptionId], references: [id], onDelete: Restrict)
+  paymentEvent   PaymentEvent          @relation(fields: [paymentEventId], references: [id], onDelete: Restrict)
+
+  @@unique([subscriptionId, paymentEventId])
+  @@index([paymentEventId])
+  @@index([status, nextAttemptAt])
+}
