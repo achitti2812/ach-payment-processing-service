@@ -1,5 +1,6 @@
 import type { PaymentStatus } from "../generated/prisma/client.js";
 
+import { PAYMENT_PROCESS_REQUESTED } from "../domain/outbox-event-types.js";
 import {
   IdempotencyConflictError,
   IdempotencyKeyAlreadyExistsError,
@@ -19,7 +20,7 @@ import type {
   PaymentRepository,
 } from "../repositories/payment-repository.js";
 
-export const PAYMENT_PROCESS_REQUESTED = "PAYMENT_PROCESS_REQUESTED";
+export { PAYMENT_PROCESS_REQUESTED };
 
 export interface PaymentResponse {
   id: string;

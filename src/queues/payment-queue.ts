@@ -6,6 +6,7 @@ export const PAYMENT_JOB_NAME = "process-payment";
 
 export interface PaymentJobData {
   paymentId: string;
+  attemptNumber?: number;
 }
 
 export type PaymentQueue = Queue<PaymentJobData, void, typeof PAYMENT_JOB_NAME>;
@@ -27,6 +28,18 @@ export function createPaymentQueue(
 
 export interface PaymentJobPublisher {
   publish(paymentId: string): Promise<void>;
+  publishRetry?(
+    paymentId: string,
+    nextAttemptNumber: number,
+    delayMs: number,
+  ): Promise<void>;
+}
+
+export function paymentRetryJobId(
+  paymentId: string,
+  attemptNumber: number,
+): string {
+  return `${paymentId}-attempt-${attemptNumber}`;
 }
 
 export class BullMqPaymentJobPublisher implements PaymentJobPublisher {
@@ -38,6 +51,21 @@ export class BullMqPaymentJobPublisher implements PaymentJobPublisher {
       { paymentId },
       {
         jobId: paymentId,
+      },
+    );
+  }
+
+  async publishRetry(
+    paymentId: string,
+    nextAttemptNumber: number,
+    delayMs: number,
+  ): Promise<void> {
+    await this.queue.add(
+      PAYMENT_JOB_NAME,
+      { paymentId, attemptNumber: nextAttemptNumber },
+      {
+        jobId: paymentRetryJobId(paymentId, nextAttemptNumber),
+        delay: Math.max(0, delayMs),
       },
     );
   }

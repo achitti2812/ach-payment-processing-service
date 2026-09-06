@@ -9,7 +9,10 @@ import {
   isPaymentTransitionAllowed,
 } from "../../src/domain/payment-state-machine.js";
 import { PaymentStatus } from "../../src/generated/prisma/enums.js";
-import { paymentExecutionKey } from "../../src/services/payment-processor.js";
+import {
+  calculateRetryDelay,
+  paymentExecutionKey,
+} from "../../src/services/payment-processor.js";
 
 describe("payment state machine", () => {
   it.each([
@@ -17,6 +20,7 @@ describe("payment state machine", () => {
     [PaymentStatus.PROCESSING, PaymentStatus.COMPLETED],
     [PaymentStatus.PROCESSING, PaymentStatus.FAILED],
     [PaymentStatus.PROCESSING, PaymentStatus.RETRYING],
+    [PaymentStatus.RETRYING, PaymentStatus.PROCESSING],
   ])("allows %s -> %s", (from, to) => {
     expect(isPaymentTransitionAllowed(from, to)).toBe(true);
     expect(() => assertPaymentTransition(from, to)).not.toThrow();
@@ -32,7 +36,11 @@ describe("payment state machine", () => {
 describe("simulated bank adapter", () => {
   const bank = new SimulatedBankClient();
 
-  function request(reference: string, executionKey = paymentExecutionKey(randomUUID())) {
+  function request(
+    reference: string,
+    attemptNumber = 1,
+    executionKey = paymentExecutionKey(randomUUID()),
+  ) {
     return {
       paymentId: randomUUID(),
       sourceAccount: "VA10001",
@@ -40,6 +48,7 @@ describe("simulated bank adapter", () => {
       amount: "250.00",
       reference,
       executionKey,
+      attemptNumber,
     };
   }
 
@@ -59,10 +68,41 @@ describe("simulated bank adapter", () => {
 
   it("returns the same bank execution ID for the same execution key", async () => {
     const executionKey = paymentExecutionKey(randomUUID());
-    const first = await bank.executePayment(request("SUCCESS-1", executionKey));
-    const second = await bank.executePayment(request("SUCCESS-2", executionKey));
+    const first = await bank.executePayment(request("SUCCESS-1", 1, executionKey));
+    const second = await bank.executePayment(request("SUCCESS-2", 2, executionKey));
 
     expect(first).toEqual(second);
     expect(paymentExecutionKey("payment-id")).toBe(paymentExecutionKey("payment-id"));
+  });
+
+  it("supports deterministic eventual success after temporary failures", async () => {
+    await expect(bank.executePayment(request("TEMP_FAIL_ONCE", 1))).resolves.toMatchObject({
+      outcome: "TEMPORARY_FAILURE",
+    });
+    await expect(bank.executePayment(request("TEMP_FAIL_ONCE", 2))).resolves.toMatchObject({
+      outcome: "SUCCESS",
+    });
+    await expect(bank.executePayment(request("TEMP_FAIL_TWICE", 2))).resolves.toMatchObject({
+      outcome: "TEMPORARY_FAILURE",
+    });
+    await expect(bank.executePayment(request("TEMP_FAIL_TWICE", 3))).resolves.toMatchObject({
+      outcome: "SUCCESS",
+    });
+  });
+});
+
+describe("retry backoff", () => {
+  it.each([
+    [1, 1000],
+    [2, 2000],
+    [3, 4000],
+    [4, 8000],
+  ])("calculates attempt %i as %i ms", (attemptNumber, expectedDelay) => {
+    expect(calculateRetryDelay(1000, attemptNumber)).toBe(expectedDelay);
+  });
+
+  it("rejects invalid inputs", () => {
+    expect(() => calculateRetryDelay(0, 1)).toThrow();
+    expect(() => calculateRetryDelay(1000, 0)).toThrow();
   });
 });

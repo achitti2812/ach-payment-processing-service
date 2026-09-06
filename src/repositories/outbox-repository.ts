@@ -1,6 +1,7 @@
 export interface UnpublishedOutboxEvent {
   id: string;
   aggregateId: string;
+  payload: unknown;
 }
 
 export interface OutboxRepository {

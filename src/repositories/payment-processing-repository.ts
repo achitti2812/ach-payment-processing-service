@@ -6,6 +6,8 @@ export interface PaymentForProcessing {
   destinationAccount: string;
   amount: Prisma.Decimal;
   reference: string;
+  attemptNumber: number;
+  maxAttempts: number;
 }
 
 export type PaymentClaimResult =
@@ -30,9 +32,18 @@ export interface ProcessingTransitionParams {
   failureCode: string | null;
   failureMessage: string | null;
   completedAt: Date | null;
+  nextRetryAt: Date | null;
+  retrySchedule?: {
+    nextAttemptNumber: number;
+  };
 }
 
 export interface PaymentProcessingRepository {
-  claimPendingPayment(paymentId: string, correlationId: string): Promise<PaymentClaimResult>;
+  claimPaymentAttempt(
+    paymentId: string,
+    expectedAttemptNumber: number | undefined,
+    correlationId: string,
+    claimedAt: Date,
+  ): Promise<PaymentClaimResult>;
   transitionProcessingPayment(params: ProcessingTransitionParams): Promise<boolean>;
 }

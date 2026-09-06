@@ -2,6 +2,10 @@ import { env } from "../config/env.js";
 import { prisma } from "../config/prisma.js";
 import { createRedisConnection } from "../config/redis.js";
 import {
+  PAYMENT_PROCESS_REQUESTED,
+  PAYMENT_RETRY_REQUESTED,
+} from "../domain/outbox-event-types.js";
+import {
   BullMqPaymentJobPublisher,
   createPaymentQueue,
 } from "../queues/payment-queue.js";
@@ -11,9 +15,16 @@ import { OutboxDispatcher } from "../services/outbox-dispatcher.js";
 const redis = createRedisConnection("producer");
 const queue = createPaymentQueue(redis);
 const repository = new PrismaOutboxRepository(prisma);
-const dispatcher = new OutboxDispatcher(
+const publisher = new BullMqPaymentJobPublisher(queue);
+const paymentDispatcher = new OutboxDispatcher(
   repository,
-  new BullMqPaymentJobPublisher(queue),
+  publisher,
+  PAYMENT_PROCESS_REQUESTED,
+);
+const retryDispatcher = new OutboxDispatcher(
+  repository,
+  publisher,
+  PAYMENT_RETRY_REQUESTED,
 );
 
 let stopping = false;
@@ -34,9 +45,12 @@ console.log("Outbox dispatcher started");
 try {
   while (!stopping) {
     try {
-      const summary = await dispatcher.dispatchBatch(env.OUTBOX_BATCH_SIZE);
+      const paymentSummary = await paymentDispatcher.dispatchBatch(env.OUTBOX_BATCH_SIZE);
+      const retrySummary = await retryDispatcher.dispatchBatch(env.OUTBOX_BATCH_SIZE);
+      const found = paymentSummary.found + retrySummary.found;
+      const failed = paymentSummary.failed + retrySummary.failed;
 
-      if (summary.found === 0 || summary.failed > 0) {
+      if (found === 0 || failed > 0) {
         await wait(env.OUTBOX_POLL_INTERVAL_MS);
       }
     } catch (error) {

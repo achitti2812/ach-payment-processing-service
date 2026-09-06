@@ -37,4 +37,9 @@ export const env = Object.freeze({
     5,
     "PAYMENT_WORKER_CONCURRENCY",
   ),
+  PAYMENT_RETRY_BASE_DELAY_MS: positiveInteger(
+    process.env.PAYMENT_RETRY_BASE_DELAY_MS,
+    1000,
+    "PAYMENT_RETRY_BASE_DELAY_MS",
+  ),
 });

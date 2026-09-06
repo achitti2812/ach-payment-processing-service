@@ -11,7 +11,7 @@ const allowedTransitions: Record<PaymentStatus, readonly PaymentStatus[]> = {
   ],
   [PaymentStatus.COMPLETED]: [],
   [PaymentStatus.FAILED]: [],
-  [PaymentStatus.RETRYING]: [],
+  [PaymentStatus.RETRYING]: [PaymentStatus.PROCESSING],
 };
 
 export function isPaymentTransitionAllowed(

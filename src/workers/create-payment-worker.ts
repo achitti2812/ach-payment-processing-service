@@ -25,7 +25,8 @@ export function createPaymentWorker(
 ): PaymentWorker {
   return new Worker<PaymentJobData, PaymentProcessingOutcome, typeof PAYMENT_JOB_NAME>(
     queueName,
-    async (job) => processor.processPayment(job.data.paymentId),
+    async (job) =>
+      processor.processPayment(job.data.paymentId, job.data.attemptNumber),
     {
       connection,
       concurrency,

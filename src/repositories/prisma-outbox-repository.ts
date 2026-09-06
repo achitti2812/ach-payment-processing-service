@@ -19,6 +19,7 @@ export class PrismaOutboxRepository implements OutboxRepository {
       select: {
         id: true,
         aggregateId: true,
+        payload: true,
       },
     });
   }

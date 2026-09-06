@@ -11,11 +11,13 @@ import { SimulatedBankClient } from "../../src/bank/simulated-bank-client.js";
 import { prisma } from "../../src/config/prisma.js";
 import { createRedisConnection } from "../../src/config/redis.js";
 import { PaymentStatus } from "../../src/generated/prisma/enums.js";
+import { PAYMENT_RETRY_REQUESTED } from "../../src/domain/outbox-event-types.js";
 import {
   BullMqPaymentJobPublisher,
   PAYMENT_JOB_NAME,
   PAYMENT_QUEUE_NAME,
   createPaymentQueue,
+  paymentRetryJobId,
 } from "../../src/queues/payment-queue.js";
 import { PrismaOutboxRepository } from "../../src/repositories/prisma-outbox-repository.js";
 import { PrismaPaymentProcessingRepository } from "../../src/repositories/prisma-payment-processing-repository.js";
@@ -48,7 +50,21 @@ class RecordingBankClient implements BankClient {
   }
 }
 
-async function createPendingPayment(reference: string, withOutbox = false) {
+class RecordingSimulatedBankClient implements BankClient {
+  readonly requests: BankPaymentRequest[] = [];
+  private readonly simulated = new SimulatedBankClient();
+
+  async executePayment(request: BankPaymentRequest): Promise<BankPaymentResult> {
+    this.requests.push(request);
+    return this.simulated.executePayment(request);
+  }
+}
+
+async function createPendingPayment(
+  reference: string,
+  withOutbox = false,
+  maxAttempts = 5,
+) {
   return prisma.$transaction(async (transaction) => {
     const payment = await transaction.payment.create({
       data: {
@@ -58,6 +74,7 @@ async function createPendingPayment(reference: string, withOutbox = false) {
         amount: "250.00",
         reference,
         status: PaymentStatus.PENDING,
+        maxAttempts,
       },
     });
 
@@ -125,6 +142,61 @@ async function paymentWithEvents(paymentId: string) {
       },
     },
   });
+}
+
+async function makeRetryDue(paymentId: string): Promise<void> {
+  await prisma.payment.update({
+    where: { id: paymentId },
+    data: { nextRetryAt: new Date(Date.now() - 1) },
+  });
+}
+
+async function processQueuedPaymentUntilTerminal(
+  paymentId: string,
+  processor: PaymentProcessor,
+): Promise<void> {
+  const workerRedis = createRedisConnection("worker");
+  const worker = createPaymentWorker(workerRedis, processor, 1, queueName);
+  const publisher = new BullMqPaymentJobPublisher(queue);
+  const initialDispatcher = new OutboxDispatcher(
+    outboxRepository,
+    publisher,
+    TEST_OUTBOX_TYPE,
+  );
+  const retryDispatcher = new OutboxDispatcher(
+    outboxRepository,
+    publisher,
+    PAYMENT_RETRY_REQUESTED,
+  );
+  const deadline = Date.now() + 5000;
+
+  try {
+    await worker.waitUntilReady();
+
+    while (Date.now() < deadline) {
+      await initialDispatcher.dispatchBatch(10);
+      await retryDispatcher.dispatchBatch(10);
+
+      const payment = await prisma.payment.findUniqueOrThrow({
+        where: { id: paymentId },
+        select: { status: true },
+      });
+
+      if (
+        payment.status === PaymentStatus.COMPLETED ||
+        payment.status === PaymentStatus.FAILED
+      ) {
+        return;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    throw new Error("Payment did not reach a terminal state before the timeout");
+  } finally {
+    await worker.close();
+    await workerRedis.quit();
+  }
 }
 
 beforeAll(async () => {
@@ -288,8 +360,8 @@ describe("payment processor", () => {
       bankExecutionId: null,
       failureCode: "BANK_TEMPORARY_UNAVAILABLE",
       completedAt: null,
-      nextRetryAt: null,
     });
+    expect(processed.nextRetryAt).not.toBeNull();
     expect(processed.events.map(({ toStatus }) => toStatus)).toEqual([
       PaymentStatus.PENDING,
       PaymentStatus.PROCESSING,
@@ -306,11 +378,212 @@ describe("payment processor", () => {
     const processor = new PaymentProcessor(paymentRepository, bank);
 
     expect(await processor.processPayment(payment.id)).toBe("COMPLETED");
-    expect(await processor.processPayment(payment.id)).toBe("SKIPPED");
+    expect(await processor.processPayment(payment.id, 2)).toBe("SKIPPED");
 
     expect(bank.requests).toHaveLength(1);
     expect(bank.requests[0]?.executionKey).toBe(paymentExecutionKey(payment.id));
     expect((await paymentWithEvents(payment.id)).events).toHaveLength(3);
+  });
+
+  it("does not process a failed payment again", async () => {
+    const payment = await createPendingPayment("PAYMENT-PERM_FAIL-LATE-RETRY");
+    const bank = new RecordingBankClient({
+      outcome: "PERMANENT_FAILURE",
+      code: "ACCOUNT_CLOSED",
+      message: "Destination account is closed",
+    });
+    const processor = new PaymentProcessor(paymentRepository, bank);
+
+    expect(await processor.processPayment(payment.id)).toBe("FAILED");
+    expect(await processor.processPayment(payment.id, 2)).toBe("SKIPPED");
+    expect(bank.requests).toHaveLength(1);
+  });
+});
+
+describe("payment retries", () => {
+  it("deduplicates replayed retry publication by attempt-specific job ID", async () => {
+    const paymentId = randomUUID();
+    const publisher = new BullMqPaymentJobPublisher(queue);
+
+    await publisher.publishRetry(paymentId, 2, 1000);
+    await publisher.publishRetry(paymentId, 2, 1000);
+
+    const jobs = await queue.getJobs(["wait", "active", "completed", "failed", "delayed"]);
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]?.id).toBe(paymentRetryJobId(paymentId, 2));
+    expect(jobs[0]?.data).toEqual({ paymentId, attemptNumber: 2 });
+  });
+
+  it("records the retry time and publishes a delayed, attempt-specific job", async () => {
+    const payment = await createPendingPayment("PAYMENT-TEMP_FAIL-DELAYED");
+    const processor = new PaymentProcessor(paymentRepository, new SimulatedBankClient(), {
+      retryBaseDelayMs: 1000,
+    });
+
+    expect(await processor.processPayment(payment.id)).toBe("RETRYING");
+
+    const retrying = await prisma.payment.findUniqueOrThrow({
+      where: { id: payment.id },
+    });
+    const retryOutbox = await prisma.outboxEvent.findFirstOrThrow({
+      where: {
+        aggregateId: payment.id,
+        type: PAYMENT_RETRY_REQUESTED,
+      },
+    });
+    expect(retrying.nextRetryAt).not.toBeNull();
+    expect(retryOutbox.publishedAt).toBeNull();
+
+    const dispatcher = new OutboxDispatcher(
+      outboxRepository,
+      new BullMqPaymentJobPublisher(queue),
+      PAYMENT_RETRY_REQUESTED,
+    );
+    expect(await dispatcher.dispatchBatch(10)).toEqual({
+      found: 1,
+      published: 1,
+      failed: 0,
+    });
+
+    const jobId = paymentRetryJobId(payment.id, 2);
+    const job = await queue.getJob(jobId);
+    expect(job?.id).toBe(jobId);
+    expect(job?.data).toEqual({ paymentId: payment.id, attemptNumber: 2 });
+    expect(job?.opts.delay).toBeGreaterThan(0);
+    expect(job?.opts.delay).toBeLessThanOrEqual(1000);
+    expect(
+      (await prisma.outboxEvent.findUniqueOrThrow({ where: { id: retryOutbox.id } }))
+        .publishedAt,
+    ).not.toBeNull();
+  });
+
+  it("rejects an early retry, then claims it once after it is due", async () => {
+    const payment = await createPendingPayment("PAYMENT-TEMP_FAIL_ONCE");
+    const bank = new RecordingSimulatedBankClient();
+    const processor = new PaymentProcessor(paymentRepository, bank, {
+      retryBaseDelayMs: 60_000,
+    });
+
+    expect(await processor.processPayment(payment.id)).toBe("RETRYING");
+    expect(await processor.processPayment(payment.id, 2)).toBe("SKIPPED");
+    expect(bank.requests).toHaveLength(1);
+
+    await makeRetryDue(payment.id);
+    expect(await processor.processPayment(payment.id, 2)).toBe("COMPLETED");
+    expect(await processor.processPayment(payment.id, 2)).toBe("SKIPPED");
+
+    const processed = await paymentWithEvents(payment.id);
+    expect(processed.attemptCount).toBe(2);
+    expect(processed.nextRetryAt).toBeNull();
+    expect(bank.requests.map(({ attemptNumber }) => attemptNumber)).toEqual([1, 2]);
+    expect(processed.events.map(({ toStatus }) => toStatus)).toEqual([
+      PaymentStatus.PENDING,
+      PaymentStatus.PROCESSING,
+      PaymentStatus.RETRYING,
+      PaymentStatus.PROCESSING,
+      PaymentStatus.COMPLETED,
+    ]);
+    expect(processed.events.map(({ reason }) => reason)).toEqual([
+      "Payment submitted",
+      "Payment processing started",
+      "Temporary bank failure; retry scheduled",
+      "Payment retry started",
+      "Payment completed",
+    ]);
+  });
+
+  it("claims duplicate retry jobs only once and ignores stale attempts", async () => {
+    const payment = await createPendingPayment("PAYMENT-TEMP_FAIL-DUPLICATE");
+    const bank = new RecordingBankClient({
+      outcome: "TEMPORARY_FAILURE",
+      code: "BANK_BUSY",
+      message: "Bank is busy",
+    });
+    const processor = new PaymentProcessor(paymentRepository, bank, {
+      retryBaseDelayMs: 60_000,
+    });
+
+    expect(await processor.processPayment(payment.id)).toBe("RETRYING");
+    await makeRetryDue(payment.id);
+
+    const outcomes = await Promise.all([
+      processor.processPayment(payment.id, 2),
+      processor.processPayment(payment.id, 2),
+    ]);
+    expect(outcomes.sort()).toEqual(["RETRYING", "SKIPPED"]);
+    expect(bank.requests).toHaveLength(2);
+
+    await makeRetryDue(payment.id);
+    expect(await processor.processPayment(payment.id, 2)).toBe("SKIPPED");
+    const retrying = await prisma.payment.findUniqueOrThrow({
+      where: { id: payment.id },
+    });
+    expect(retrying.status).toBe(PaymentStatus.RETRYING);
+    expect(retrying.attemptCount).toBe(2);
+    expect(bank.requests).toHaveLength(2);
+  });
+
+  it("fails at maxAttempts without exceeding the limit", async () => {
+    const payment = await createPendingPayment("PAYMENT-TEMP_FAIL-FOREVER", false, 3);
+    const processor = new PaymentProcessor(paymentRepository, new SimulatedBankClient(), {
+      retryBaseDelayMs: 60_000,
+    });
+
+    expect(await processor.processPayment(payment.id)).toBe("RETRYING");
+    await makeRetryDue(payment.id);
+    expect(await processor.processPayment(payment.id, 2)).toBe("RETRYING");
+    await makeRetryDue(payment.id);
+    expect(await processor.processPayment(payment.id, 3)).toBe("FAILED");
+    expect(await processor.processPayment(payment.id, 4)).toBe("SKIPPED");
+
+    const failed = await paymentWithEvents(payment.id);
+    expect(failed).toMatchObject({
+      status: PaymentStatus.FAILED,
+      attemptCount: 3,
+      maxAttempts: 3,
+      failureCode: "RETRY_EXHAUSTED",
+      completedAt: null,
+      nextRetryAt: null,
+    });
+    expect(failed.failureMessage).toContain("exhausted after 3 attempts");
+    expect(failed.events.map(({ sequenceNumber }) => sequenceNumber)).toEqual([
+      1, 2, 3, 4, 5, 6, 7,
+    ]);
+    expect(failed.events.map(({ toStatus }) => toStatus)).toEqual([
+      PaymentStatus.PENDING,
+      PaymentStatus.PROCESSING,
+      PaymentStatus.RETRYING,
+      PaymentStatus.PROCESSING,
+      PaymentStatus.RETRYING,
+      PaymentStatus.PROCESSING,
+      PaymentStatus.FAILED,
+    ]);
+    expect(failed.events.at(-1)?.reason).toBe("Payment failed after retry exhaustion");
+  });
+
+  it.each([
+    ["PAYMENT-TEMP_FAIL_ONCE", 2],
+    ["PAYMENT-TEMP_FAIL_TWICE", 3],
+  ])("eventually completes %s through delayed BullMQ jobs", async (reference, attempts) => {
+    const payment = await createPendingPayment(reference, true);
+    const bank = new RecordingSimulatedBankClient();
+    const processor = new PaymentProcessor(paymentRepository, bank, {
+      retryBaseDelayMs: 25,
+    });
+
+    await processQueuedPaymentUntilTerminal(payment.id, processor);
+
+    const completed = await paymentWithEvents(payment.id);
+    expect(completed.status).toBe(PaymentStatus.COMPLETED);
+    expect(completed.attemptCount).toBe(attempts);
+    expect(completed.nextRetryAt).toBeNull();
+    expect(bank.requests.map(({ attemptNumber }) => attemptNumber)).toEqual(
+      Array.from({ length: attempts }, (_, index) => index + 1),
+    );
+    expect(completed.events).toHaveLength(1 + attempts * 2);
+    expect(completed.events.map(({ sequenceNumber }) => sequenceNumber)).toEqual(
+      Array.from({ length: 1 + attempts * 2 }, (_, index) => index + 1),
+    );
   });
 });
 

@@ -11,6 +11,7 @@ const redis = createRedisConnection("worker");
 const processor = new PaymentProcessor(
   new PrismaPaymentProcessingRepository(prisma),
   new SimulatedBankClient(),
+  { retryBaseDelayMs: env.PAYMENT_RETRY_BASE_DELAY_MS },
 );
 
 const worker = createPaymentWorker(

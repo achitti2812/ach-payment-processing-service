@@ -5,6 +5,7 @@ export interface BankPaymentRequest {
   amount: string;
   reference: string;
   executionKey: string;
+  attemptNumber: number;
 }
 
 export type BankPaymentResult =

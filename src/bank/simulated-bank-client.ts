@@ -14,8 +14,15 @@ function simulatedExecutionId(executionKey: string): string {
 export class SimulatedBankClient implements BankClient {
   async executePayment(request: BankPaymentRequest): Promise<BankPaymentResult> {
     const reference = request.reference.toUpperCase();
+    const temporaryFailureAttempts = reference.includes("TEMP_FAIL_TWICE")
+      ? 2
+      : reference.includes("TEMP_FAIL_ONCE")
+        ? 1
+        : reference.includes("TEMP_FAIL")
+          ? Number.POSITIVE_INFINITY
+          : 0;
 
-    if (reference.includes("TEMP_FAIL")) {
+    if (request.attemptNumber <= temporaryFailureAttempts) {
       return {
         outcome: "TEMPORARY_FAILURE",
         code: "BANK_TEMPORARY_UNAVAILABLE",
